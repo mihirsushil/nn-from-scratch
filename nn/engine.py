@@ -6,7 +6,24 @@ on NumPy arrays instead of scalars, so it's fast enough to train a real
 model on real data.
 """
 
+import os
+
 import numpy as np
+
+# Optional C++ forward kernels (csrc/nn_cpp.cpp, built with
+# `python setup.py build_ext --inplace`). Absent extension => pure NumPy.
+#
+# Opt-in, not default: bench/bench_matmul.py measures NumPy's Accelerate BLAS at
+# ~285 GFLOP/s on this machine versus ~10 GFLOP/s for the hand-written loop, and
+# a C++ matmul makes a training step ~5x slower. The extension exists as a
+# readable reference kernel and a benchmark artifact, so it must be requested
+# explicitly: NN_CPP=1.
+try:
+    import nn_cpp
+except ImportError:  # pragma: no cover - depends on whether the extension is built
+    nn_cpp = None
+
+_USE_CPP = nn_cpp is not None and os.environ.get("NN_CPP", "0") == "1"
 
 
 class Tensor:
@@ -102,7 +119,11 @@ class Tensor:
     def __matmul__(self, other):
         other = self._as_tensor(other)
         requires_grad = self.requires_grad or other.requires_grad
-        out = Tensor(self.data @ other.data, requires_grad, (self, other), "@")
+        if _USE_CPP and self.data.ndim == 2 and other.data.ndim == 2:
+            data = nn_cpp.matmul(self.data, other.data)
+        else:
+            data = self.data @ other.data
+        out = Tensor(data, requires_grad, (self, other), "@")
 
         def _backward():
             if self.requires_grad:

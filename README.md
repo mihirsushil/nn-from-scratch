@@ -29,6 +29,12 @@ not just call `.fit()`.
 - `train_mnist.py` — loads real MNIST (784-pixel, 10-class) via
   scikit-learn, trains a 784→128→64→10 MLP with mini-batch SGD, and plots
   loss/accuracy curves.
+- `csrc/nn_cpp.cpp` + `tests/test_cpp_ops.py` — an optional C++ (pybind11)
+  implementation of the engine's two hot forward kernels, matmul and softmax,
+  gradient-checked against the NumPy path. Off by default; see
+  (see below) for the measurements that explain why.
+- `bench/bench_matmul.py` — kernel-level and step-level benchmarks; writes
+  `results/matmul_benchmark.md`.
 
 ## How backprop works here, briefly
 
@@ -73,3 +79,45 @@ full 70,000-image MNIST set (60k train / 10k test):
   implementation, not a lucky bug that happens to train anyway
 
 ![training curves](results/training_curves.png)
+
+## C++ kernels: measured, and deliberately not the default
+
+`csrc/nn_cpp.cpp` implements the engine's two hot forward kernels — 2-D matmul
+and row-wise softmax — as a small pybind11 extension, and `Tensor.__matmul__`
+dispatches to it when the extension is built and `NN_CPP=1` is set. It is
+opt-in on purpose. `bench/bench_matmul.py` is the reason:
+
+| | NumPy | C++ kernel |
+|---|---:|---:|
+| 128x784 @ 784x128 | 0.09 ms (~285 GFLOP/s) | 2.50 ms (~10 GFLOP/s) |
+| 1024x1024 @ 1024x1024 | 8.4 ms (~273 GFLOP/s) | 208 ms (~10 GFLOP/s) |
+| full training step (batch 128) | 0.65 ms | 3.37 ms |
+
+Two findings, and the second one is the useful one:
+
+1. **A hand-written loop cannot compete with Accelerate on Apple silicon.** The
+   BLAS path reaches ~285 GFLOP/s because Accelerate dispatches to the AMX
+   matrix coprocessor; the plain `i-k-j` loop saturates around 10 GFLOP/s. This
+   is the expected outcome, and it is measured here rather than assumed.
+2. **The kernel was never the bottleneck.** Matmul is only ~19% of a NumPy
+   training step; the other ~80% is Python graph construction (Tensor
+   allocation, closures, broadcasting). No kernel swap can remove that, so
+   making the C++ path the default would have made the project ~5x slower for
+   no structural gain — hence opt-in.
+
+The honest answer to "should this engine get a C++ backend?" is: not for speed.
+The lever that would actually move step time is graph-level fusion (or a C++
+autograd core), not a matmul kernel. The extension stays as a readable
+reference implementation and as the artifact behind these numbers.
+
+```bash
+pip install pybind11 setuptools
+python setup.py build_ext --inplace
+NN_CPP=1 pytest tests/              # exercise the C++ path as well as NumPy
+python bench/bench_matmul.py        # rewrites results/matmul_benchmark.md
+```
+
+Both paths are checked by the same gradient tests: `tests/test_cpp_ops.py`
+verifies the C++ kernels against NumPy to 1e-12 and re-runs the finite-difference
+gradient check with the C++ forward active, so the backward pass is proven to
+stay correct whichever forward is used.
